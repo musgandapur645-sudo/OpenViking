@@ -44,6 +44,11 @@ class TestGitConfigValidation:
         assert cfg.local.base_dir == "/tmp/git"
 
 
+class TestGitS3ConfigStrict:
+    def test_unknown_field_rejected(self):
+        with pytest.raises(ValidationError):
+            GitS3Config(bucket="b", region="r", unknown_thing=True)
+
 class TestGitConfigOnOpenVikingConfig:
     def test_open_viking_config_has_git_field_with_default(self):
         cfg = OpenVikingConfig(storage={"workspace": "/tmp/x"})

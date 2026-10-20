@@ -115,4 +115,8 @@ def test_explicit_local_routes_reach_completion_unchanged(
         assert kwargs.get("api_key") == api_key
         assert kwargs.get("api_base") == api_base
         if model.startswith(("ollama/", "ollama_chat/")):
-            assert kwargs["extra_body"] == {"num_ctx": 16384, "think": False} | extra_body
+            expected_num_ctx = extra_body.get("num_ctx", 16384)
+            assert kwargs.get("num_ctx") == expected_num_ctx
+            expected_extra = {"think": False} | extra_body
+            expected_extra.pop("num_ctx", None)
+            assert kwargs["extra_body"] == expected_extra

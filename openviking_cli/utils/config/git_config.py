@@ -3,7 +3,7 @@
 """Git version control configuration for OpenViking."""
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class GitLocalConfig(BaseModel):
@@ -22,6 +22,8 @@ class GitS3Config(BaseModel):
     Fields mirror the Rust ``GitS3ConfigPy`` serde struct so that the rendered
     ``[git.s3]`` TOML section is consumed verbatim by the ragfs binding.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     bucket: str = Field(
         default="",
@@ -64,6 +66,8 @@ class GitS3Config(BaseModel):
 
 class GitConfig(BaseModel):
     """Git multi-version management configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(
         default=True,

@@ -550,9 +550,7 @@ class FeishuConfig(ParserConfig):
     max_rows_per_sheet: int = 1000
     max_records_per_table: int = 1000
     download_images: bool = True
-    request_timeout: float = (
-        30.0  # TODO: not yet passed to lark-oapi client, reserved for future use
-    )
+    request_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         self.validate()

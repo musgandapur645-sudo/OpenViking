@@ -86,11 +86,13 @@ class TestGeminiConfigValidation:
             EmbeddingModelConfig(model="gemini-embedding-2-preview", provider="gemini")
 
     def test_invalid_query_param_raises(self):
-        with pytest.raises(ValueError, match="Invalid query_param"):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="invalid query_param"):
             _gcfg(query_param="NOT_A_VALID_TYPE")
 
     def test_invalid_document_param_raises(self):
-        with pytest.raises(ValueError, match="Invalid document_param"):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="invalid document_param"):
             _gcfg(document_param="ALSO_INVALID")
 
     def test_query_document_param_case_normalized(self):

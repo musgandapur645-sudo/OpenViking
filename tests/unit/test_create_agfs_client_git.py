@@ -26,6 +26,8 @@ class _FakeAgfsConfig:
         self.queuefs = SimpleNamespace(
             backend="sqlite", recover_stale_sec=0, busy_timeout_ms=5000, db_path=None
         )
+        # pathlock consumed by RagfsBindingConfig.to_binding_dict()
+        self.pathlock = SimpleNamespace(model_dump=lambda **kwargs: {})
 
 
 @pytest.fixture

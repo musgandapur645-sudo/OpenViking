@@ -6,7 +6,10 @@ import time
 
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
-import volcenginesdkarkruntime
+try:
+    import volcenginesdkarkruntime
+except ImportError:
+    volcenginesdkarkruntime = None
 from openviking_cli.utils.logger import default_logger as logger
 
 from openviking.models.embedder.base import (
@@ -87,7 +90,9 @@ def _create_sync_ark(kwargs: Dict[str, Any]):
     )
     if http_client is not None:
         client_kwargs["http_client"] = http_client
-    return volcenginesdkarkruntime.Ark(**client_kwargs)
+    if volcenginesdkarkruntime is None:
+        raise RuntimeError("volcenginesdkarkruntime not installed")
+    return volcenginesdkarkruntime.Ark(**client_kwargs)  # type: ignore[union-attr]
 
 
 def _create_async_ark(kwargs: Dict[str, Any]):
@@ -98,7 +103,9 @@ def _create_async_ark(kwargs: Dict[str, Any]):
     )
     if http_client is not None:
         client_kwargs["http_client"] = http_client
-    return volcenginesdkarkruntime.AsyncArk(**client_kwargs)
+    if volcenginesdkarkruntime is None:
+        raise RuntimeError("volcenginesdkarkruntime not installed")
+    return volcenginesdkarkruntime.AsyncArk(**client_kwargs)  # type: ignore[union-attr]
 
 
 def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
