@@ -33,8 +33,10 @@ const enums = {
   captureStatus: {
     active: '正常',
     disabled: '已关闭',
+    failed: '保存失败',
     retrying: '重试中',
     paused: '已暂停',
+    lost: '已丢失',
   },
   captureReason: {
     history_changed: '对话历史有改动，后续内容改存到新的 OpenViking 会话',
@@ -46,11 +48,18 @@ const enums = {
     delivery_recovered: '保存已恢复正常',
     delivery_failed: '保存到 OpenViking 失败',
     invalid_archive_id: 'OpenViking 返回了无法识别的归档',
+    gateway_key_missing: '密钥记录缺失',
+    stage_failed: '一轮已完成的对话没能排入保存队列',
+    save_timeout: '保存到 OpenViking 超时',
+    save_failed: '保存到 OpenViking 失败',
+    delivered: '已保存到 OpenViking',
+    committed: '已在 OpenViking 中提交',
   },
   recallReason: {
     recalled: '已补充记忆',
     empty: '没有找到相关内容',
     disabled: '召回已关闭或预算已用完',
+    budget: '剩余预算不足，未补充记忆',
     recall_timeout: '召回超时',
   },
   toolSkipReason: {
@@ -63,9 +72,9 @@ const enums = {
     tools_forced_choice: '客户端指定了必须调用的工具',
     deepseek_reasoning_history_required:
       'DeepSeek 开启了思考模式，但之前回复的推理内容补不回来',
-    tool_name_collision: '客户端定义了同名工具',
-    tools_unavailable: '这段对话开始时无法加载 OpenViking 工具清单',
-    tools_not_selected_at_session_start: '这段对话开始时还没有启用工具',
+    tool_name_collision: '客户端已接入 OpenViking 工具',
+    tools_unavailable: '这段对话首次需要工具时无法加载 OpenViking 工具清单',
+    tools_not_selected_at_session_start: '这段对话没有 OpenViking 工具',
   },
   toolStopReason: {
     token_budget: '工具 Token 预算已用完',
@@ -76,13 +85,16 @@ const enums = {
   },
   openviking: {
     unavailable: 'OpenViking 无法访问或响应超时',
+    timeout: 'OpenViking 响应超时',
+    circuitOpen: 'OpenViking 对这个账号持续无响应，暂时跳过',
+    budgetExhausted: '分配给 OpenViking 调用的时间已用完',
     unauthorized: 'OpenViking 拒绝了这个密钥，它可能填错了或已被吊销。',
     httpStatus: 'OpenViking 返回了 HTTP {{status}}',
     errorCode: 'OpenViking 报告了错误 {{code}}',
     versionMismatch: 'OpenViking 版本低于网关的要求',
     identityMissing: 'OpenViking 无法识别这个密钥所属的用户',
-    rootKey: '不接受 Root 密钥，请使用本账号下的用户密钥。',
-    otherAccount: '这个 OpenViking 密钥属于其他账号。',
+    rootKey: '不接受 Root API 密钥，请使用本账号下的用户 API 密钥。',
+    otherAccount: '这个 OpenViking API 密钥属于其他账号。',
   },
   degradation: {
     memory_store_failure: {
@@ -147,6 +159,12 @@ const enums = {
       explanation:
         '流式回复无法解析，这条回复没有保存到 OpenViking。客户端不受影响。',
       action: '偶尔出现无需处理；频繁出现时再排查。',
+    },
+    revocation_check_unavailable: {
+      label: '密钥未校验',
+      explanation:
+        'OpenViking 无法确认这个网关密钥，请求在未检查密钥是否已吊销的情况下照常处理。',
+      action: '检查 OpenViking 是否可达、运行是否正常。',
     },
   },
 }

@@ -69,6 +69,9 @@ def test_recall_line_clips_names_and_stays_short():
         ("openviking_http_503", "OpenViking HTTP 503"),
         ("openviking_version_mismatch", "OpenViking version mismatch"),
         ("recall_timeout", "OpenViking timed out"),
+        ("openviking_timeout", "OpenViking timed out"),
+        ("openviking_circuit_open", "OpenViking is not answering; skipped"),
+        ("openviking_budget_exhausted", "OpenViking time budget used up"),
         ("openviking_FORBIDDEN", "openviking_FORBIDDEN"),
     ],
 )
@@ -83,9 +86,10 @@ def test_quiet_reasons_show_nothing(reason):
 
 
 def test_session_start_lists_injected_parts_in_order():
-    notice = recall_notice(["skills", "history", "profile", "memories"], "recalled", [entry("a/x")])
+    parts = ["skills", "history", "profile", "soul", "memories"]
+    notice = recall_notice(parts, "recalled", [entry("a/x")])
     assert notice == (
-        "> OpenViking context: user profile, memory index, skill list, earlier sessions\n"
+        "> OpenViking context: soul, user profile, memory index, skill list, earlier sessions\n"
         "> OpenViking recall: 1 item — x\n\n"
     )
     assert RECALL_NOTICE.fullmatch(notice)
@@ -495,7 +499,9 @@ async def test_anthropic_reasoning_restore_ignores_the_notice(running_gateway):
         if k not in {"id", "revision", "has_api_key", "header_names", "account"}
     }
     response = await client.put(
-        "/admin/upstreams/anthropic", headers=admin, json={**payload, "replay_reasoning": True}
+        "/admin/upstreams/anthropic",
+        headers=admin,
+        json={**payload, "replay_reasoning": True},
     )
     assert response.status_code == 200, response.text
     requests, upstream = [], []

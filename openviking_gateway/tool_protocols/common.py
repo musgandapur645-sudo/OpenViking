@@ -13,6 +13,7 @@ import functools
 import itertools
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import orjson
@@ -30,9 +31,21 @@ SUMMARY_HEADROOM = 16000
 
 
 class ToolLoopError(Exception):
-    def __init__(self, reason, status=502, content=None, headers=None):
+    """``code`` is the request record's error reason; the message is what clients see."""
+
+    def __init__(
+        self,
+        reason,
+        status=502,
+        content=None,
+        headers=None,
+        event=None,
+        *,
+        code="tool_upstream_invalid",
+    ):
         super().__init__(reason)
         self.status, self.content, self.headers = status, content, headers or {}
+        self.event, self.code = event, code
 
 
 class SummaryError(Exception):
@@ -41,6 +54,18 @@ class SummaryError(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+def append(target, key, text):
+    """``target[key] += text``, in linear time over a whole stream of deltas."""
+    value = target.get(key) or ""
+    # Without the dict's reference the string is the local's alone, so CPython grows it
+    # in place instead of copying everything streamed so far for every delta.
+    target[key] = ""
+    try:
+        value += text
+    finally:
+        target[key] = value
 
 
 def merge_delta(target, delta):
@@ -52,7 +77,7 @@ def merge_delta(target, delta):
                 target[key] = {}
             merge_delta(target[key], value)
         elif isinstance(value, str) and key not in {"role", "type", "id"}:
-            target[key] = (target.get(key) or "") + value
+            append(target, key, value)
         elif isinstance(value, list):
             target.setdefault(key, []).extend(copy.deepcopy(value))
         else:
@@ -60,13 +85,22 @@ def merge_delta(target, delta):
 
 
 def add_usage(total, usage):
+    """Sum per-round usage; a null in one round never erases another's counts."""
     for key, value in usage.items():
+        if value is None:
+            continue
         if isinstance(value, dict):
             add_usage(total.setdefault(key, {}), value)
-        elif isinstance(value, (int, float)):
+        # Flags such as OpenRouter's is_byok are kept, not summed.
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
             total[key] = total.get(key, 0) + value
         else:
             total[key] = value
+
+
+def merge_usage(total, usage):
+    """Overlay a later usage event; nulls, and zeros over counts, never erase earlier ones."""
+    total.update({k: v for k, v in usage.items() if v is not None and (v or not total.get(k))})
 
 
 def without(value, path):
@@ -189,6 +223,8 @@ class ToolProtocol(ABC):
     # Thinking signatures cover the history before them, so history the gateway
     # cannot resend exactly must go upstream without its thinking.
     signed_thinking = False
+    # Usage counts cached and written prompt tokens apart from the input total.
+    usage_excludes_cache = False
 
     def __init__(self, body: dict):
         self.body = body
@@ -207,10 +243,6 @@ class ToolProtocol(ABC):
     def enhanced_supported(body: dict) -> bool:
         """Whether the body carries the whole history, which recall and replay need."""
         return True
-
-    @staticmethod
-    def auth_header(key: str) -> dict:
-        return {"authorization": "Bearer " + key}
 
     @staticmethod
     def is_reply(message: dict) -> bool:
@@ -259,8 +291,8 @@ class ToolProtocol(ABC):
         body["tool_choice"] = "none"
 
     @staticmethod
-    def history_chain(messages: list[dict]) -> list[str]:
-        return prefix_chain(messages)
+    def history_chain(messages: list[dict], after: Sequence[str] = ()) -> list[str]:
+        return prefix_chain(messages, after)
 
     @staticmethod
     def join_replayed_history(messages: list[dict]) -> list[dict]:
@@ -375,7 +407,9 @@ class ToolProtocol(ABC):
         return {
             "message": message,
             "output_items": items,
-            "usage": usage_of({"usage": self.usage}) if self.usage else None,
+            "usage": (
+                usage_of({"usage": self.usage}, self.usage_excludes_cache) if self.usage else None
+            ),
             "response_id": self.envelope.get("id") or "",
             "complete": ended and not handoff,
             "handoff": handoff,
@@ -423,8 +457,12 @@ class ToolProtocol(ABC):
     def terminal(self, final: dict) -> list[StreamEvent]:
         """Return the protocol's success terminal events."""
 
-    def error(self, message: str) -> list[StreamEvent]:
-        return [{"type": "error", "error": {"type": "gateway_tool_error", "message": message}}]
+    def error(self, message: str, kind: str = "gateway_tool_error") -> list[StreamEvent]:
+        return [{"type": "error", "error": {"type": kind, "message": message}}]
+
+    def upstream_error(self, event: dict) -> list[StreamEvent]:
+        """Return a normalized upstream error with this protocol's terminator."""
+        return [event]
 
     def encode(self, value: StreamEvent) -> bytes:
         if value is None:

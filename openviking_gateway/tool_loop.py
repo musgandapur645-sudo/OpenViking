@@ -8,17 +8,20 @@ import time
 import async_timeout
 import orjson
 
-from .capture import CapturePipeline
 from .compaction import cut_messages
 from .notices import tool_tail
+from .observe import degrade
 from .protocols import SSEDecoder, replays_reasoning, usage_of
 from .records import RecordKind as K
 from .tool_catalog import notice_head
-from .tool_protocols import hidden_chain, tool_protocol
+from .tool_protocols import reply_chain, tool_protocol
 from .tool_protocols.common import PREFIX, ToolLoopError, ToolRound, add_usage
 from .windows import ALONE, NEW_CONTEXT, window_number
 
 REFUSED = "OpenViking tools are unavailable for the rest of this request; continue without them."
+STREAM_ERROR_MESSAGE = "Model stream failed"
+# Transport failures of the model provider; a stream error event carries them as its type.
+TRANSPORT_REASONS = {"upstream_timeout", "upstream_disconnected", "upstream_unreachable"}
 
 
 def added_tokens(value):
@@ -26,9 +29,31 @@ def added_tokens(value):
     return (len(orjson.dumps(value)) + 2) // 3
 
 
+def public_stream_error(value):
+    """An upstream error restricted to protocol-level fields."""
+    event: dict[str, object] = {"type": "error"}
+    for key in ("code", "message"):
+        if isinstance(value.get(key), str):
+            event[key] = value[key]
+    detail = value.get("error")
+    if isinstance(detail, dict):
+        safe_detail = {
+            key: detail[key]
+            for key in ("type", "code", "message")
+            if isinstance(detail.get(key), str)
+        }
+        safe_detail.setdefault("message", STREAM_ERROR_MESSAGE)
+        event["error"] = safe_detail
+    elif "message" not in event:
+        event["message"] = STREAM_ERROR_MESSAGE
+    return event
+
+
 class HiddenToolLoop:
-    def __init__(self, prepared, executor, store, capture):
+    def __init__(self, prepared, executor, store, capture, saver=None):
+        """``saver`` is the kernel's capture pipeline; without one a cut is not saved early."""
         self.prepared, self.executor, self.store, self.capture = prepared, executor, store, capture
+        self.saver = saver
         self.protocol = prepared.protocol
         self.adapter = tool_protocol(self.protocol)(prepared.body)
         self.body = {
@@ -39,13 +64,10 @@ class HiddenToolLoop:
         # A request without gateway tools comes here only to show the recall notice: every
         # call is the client's, nothing runs, and the reply takes as long as it takes.
         self.allowed = executor.allowed if prepared.tools_active else set()
-        self.deadline = (
-            time.monotonic() + self.policy.get("tool_total_seconds", 120)
-            if prepared.tools_active
-            else None
-        )
+        seconds = self.policy.get("tool_total_seconds")
+        self.deadline = time.monotonic() + seconds if prepared.tools_active and seconds else None
         self.adapter.lead_with(prepared.reply_lead)
-        self.transcript, self.usage = [], {}
+        self.transcript, self.usage, self.counted = [], {}, {}
         self.final, self.hidden, self.window = None, False, None
         self.rounds, self.token_cost, self.refused = 0, 0, False
         self.round = ToolRound([], [], {}, False)
@@ -59,6 +81,7 @@ class HiddenToolLoop:
                 response.status,
                 await response.read(),
                 dict(response.headers),
+                code="upstream_error",
             )
         if response.headers.get("content-encoding"):
             raise ToolLoopError("Compressed tool responses are unsupported")
@@ -71,24 +94,42 @@ class HiddenToolLoop:
             async for chunk in response.content.iter_any():
                 received += len(chunk)
                 if received > 64 * 1024 * 1024:
-                    raise ToolLoopError("Model stream exceeds tool response budget")
-                for frame in decoder.feed(chunk):
-                    value = decoder.data(frame)
-                    if value is None:
-                        continue
-                    if "error" in value or value.get("type") == "error":
-                        raise ToolLoopError("Model stream failed")
-                    for event in adapter.event(value):
-                        yield adapter.encode(event)
+                    raise ToolLoopError(
+                        "Model stream exceeds tool response budget", code="tool_loop_limit"
+                    )
+                # Events that arrive together leave in one write, any before a failure included.
+                events = []
+                try:
+                    events.extend(self.decode(decoder, chunk))
+                finally:
+                    if events:
+                        yield b"".join(events)
             if decoder.buffer.strip():
-                raise ToolLoopError("Incomplete model event stream")
+                raise ToolLoopError(
+                    "Incomplete model event stream", code="tool_upstream_incomplete"
+                )
         self.round = adapter.end()
         response.close()
+
+    def decode(self, decoder, chunk):
+        """Client bytes for the upstream events ``chunk`` completes."""
+        for frame in decoder.feed(chunk):
+            value = decoder.data(frame)
+            if value is None:
+                continue
+            if "error" in value or value.get("type") == "error":
+                raise ToolLoopError(
+                    STREAM_ERROR_MESSAGE,
+                    event=public_stream_error(value),
+                    code="tool_upstream_stream_error",
+                )
+            for event in self.adapter.event(value):
+                yield self.adapter.encode(event)
 
     def observe(self):
         self.transcript.extend(self.round.output)
         add_usage(self.usage, self.round.usage)
-        normalized = usage_of({"usage": self.round.usage})
+        normalized = usage_of({"usage": self.round.usage}, self.adapter.usage_excludes_cache)
         if normalized["input_tokens"]:
             # The latest round measures the window best; native tools read it here.
             self.capture.context_usage = normalized
@@ -99,6 +140,9 @@ class HiddenToolLoop:
         prefix = "hidden_upstream_" if self.rounds else "first_upstream_"
         for key, value in normalized.items():
             self.prepared.metrics[prefix + key] = self.prepared.metrics.get(prefix + key, 0) + value
+            if self.round.usage:
+                # Rounds may report usage in different forms, so the log sums them read one by one.
+                self.counted[key] = self.counted.get(key, 0) + value
 
     def stream(self, events):
         # Adapters update visible history either way; only streams send events.
@@ -111,15 +155,18 @@ class HiddenToolLoop:
         the model goes on with the client's tools; calling again right after a refused
         round ends the request.
         """
-        budget = self.policy.get("tool_total_tokens", 100000)
+        budget = self.policy.get("tool_total_tokens") or float("inf")
+        rounds = self.policy.get("tool_max_rounds") or float("inf")
         closed = (
             self.prepared.tools_closed
             or self.adapter.tool_choice(self.body) == "none"
-            or self.rounds >= self.policy.get("tool_max_rounds", 5)
+            or self.rounds >= rounds
             or self.token_cost >= budget
         )
         if closed and self.refused:
-            raise ToolLoopError("Model exceeded the hidden tool round limit")
+            raise ToolLoopError(
+                "Model exceeded the hidden tool round limit", code="tool_loop_limit"
+            )
         self.refused = closed
         if not self.rounds:
             self.token_cost += added_tokens(calls)
@@ -159,6 +206,9 @@ class HiddenToolLoop:
                 yield event
         if window:
             self.reset(*window)
+            # Later rounds of this request may search the part the cut replaced.
+            if self.saver:
+                await self.saver.save_cut(self.prepared, self.executor.credential, window[0])
         else:
             results = self.adapter.results(results)
             self.transcript.extend(results)
@@ -184,9 +234,7 @@ class HiddenToolLoop:
         # The next request strips the recall notice before matching, so the anchor,
         # the visible count and the replaced span all go without it.
         visible = self.adapter.strip_lead(self.adapter.visible)
-        anchor = (
-            hidden_chain([*self.prepared.messages, *visible], self.protocol)[-1] if visible else ""
-        )
+        anchor = reply_chain(self.prepared, visible)[-1] if visible else ""
         if self.window:
             # new_context refuses an anchor whose cut this request applies, so only a
             # concurrent request can have stored another header here first.
@@ -206,7 +254,7 @@ class HiddenToolLoop:
             # which relaying recorded as the same reply; the transcript replaces it there too.
             dropped, _ = self.adapter.split_reasoning(visible)
             if dropped is not visible and replays_reasoning(self.prepared.upstream):
-                other = hidden_chain([*self.prepared.messages, *dropped], self.protocol)[-1]
+                other = reply_chain(self.prepared, dropped)[-1]
                 if dropped and other:
                     await self.store.replay.put(
                         self.prepared.scope,
@@ -216,22 +264,30 @@ class HiddenToolLoop:
                         {**value, "visible_count": len(dropped)},
                     )
         elif self.hidden:
-            self.prepared.metrics["degradation"] = "hidden_reply_without_anchor"
-        if self.window:
-            await CapturePipeline(self.store.capture).confirm_cut(self.prepared, self.window[0])
+            degrade(self.prepared.metrics, "hidden_reply_without_anchor")
         self.final = self.adapter.final(self.usage)
         # The combined reply reads like any relayed one: calls left for the client
         # hand the turn off, and the continuation that ends it is captured.
         self.capture.nonstream(self.final)
+        self.capture.usage = self.counted or self.capture.usage
         self.prepared.metrics["hidden_rounds"] = self.rounds
 
-    def error(self, message: str) -> bytes:
-        return b"".join(self.adapter.encode(event) for event in self.adapter.error(message))
+    def error(self, error: Exception) -> bytes:
+        code = getattr(error, "code", None)
+        if isinstance(error, ToolLoopError) and error.event is not None:
+            events = self.adapter.upstream_error(error.event)
+        elif code in TRANSPORT_REASONS:
+            # A provider failure is named by its reason, as on a stream without tools.
+            events = self.adapter.error(str(error), kind=code)
+        else:
+            events = self.adapter.error(str(error))
+        return b"".join(self.adapter.encode(event) for event in events)
 
     async def run(self, response, send):
         """Publish the terminal event only after the exact transcript is durable."""
+        limit = async_timeout.timeout_at(self.deadline)
         try:
-            async with async_timeout.timeout_at(self.deadline):
+            async with limit:
                 while True:
                     async for event in self.read(response):
                         yield event
@@ -245,11 +301,16 @@ class HiddenToolLoop:
                             continue
                         name = call["function"]["name"]
                         if name.startswith(PREFIX) and name not in self.allowed:
-                            raise ToolLoopError("Model called an unavailable gateway tool")
+                            raise ToolLoopError(
+                                "Model called an unavailable gateway tool", code="tool_call_invalid"
+                            )
                         (owned if name in self.allowed else client).append(call)
                     if owned:
                         if not self.round.tool_stop:
-                            raise ToolLoopError("Gateway tool call has an invalid stop reason")
+                            raise ToolLoopError(
+                                "Gateway tool call has an invalid stop reason",
+                                code="tool_call_invalid",
+                            )
                         async for event in self.execute(owned):
                             yield event
                     for event in self.stream(self.adapter.publish_calls(client)):
@@ -260,10 +321,21 @@ class HiddenToolLoop:
                             for event in self.adapter.terminal(self.final):
                                 yield self.adapter.encode(event)
                         return
-                    response = await send(self.body, max(0.01, self.deadline - time.monotonic()))
+                    remaining = self.deadline and max(0.01, self.deadline - time.monotonic())
+                    response = await send(self.body, remaining)
         except (ValueError, TypeError, KeyError, IndexError) as error:
             raise ToolLoopError("Invalid model tool response") from error
         except asyncio.TimeoutError as error:
-            raise ToolLoopError("Hidden tool request timed out", 504) from error
+            # The upstream's own wait can run out before the loop's deadline. The clock
+            # decides, not only the flag: on Python 3.10 an inner timer that fired at the
+            # same time turns the cancellation into a TimeoutError and the flag stays unset.
+            reached = self.deadline is not None and time.monotonic() >= self.deadline
+            if not (limit.expired or reached):
+                raise ToolLoopError(
+                    "Model upstream did not answer in time", 504, code="upstream_timeout"
+                ) from error
+            raise ToolLoopError(
+                "Hidden tool request timed out", 504, code="tool_loop_timeout"
+            ) from error
         finally:
             response.close()

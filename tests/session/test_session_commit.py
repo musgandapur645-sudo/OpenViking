@@ -9,10 +9,24 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from openviking.message import TextPart
+from openviking.scheduling.expiry import (
+    CallbackRequest,
+    CallbackStatus,
+    ExpiryScheduler,
+    ItemIdentity,
+)
 from openviking.server.identity import RequestContext
 from openviking.service.core import OpenVikingService
 from openviking.service.task_tracker import get_task_tracker
 from openviking.session import Session
+from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
+from openviking.session.memory.memory_updater import (
+    MemoryReadError,
+    MemoryUpdateError,
+    MemoryUpdateResult,
+)
+from openviking.session.memory.streaming_memory_updater import StreamingMemoryUpdaterConfig
+from openviking.utils.time_utils import parse_iso_datetime
 
 
 async def _wait_for_task(task_id: str, timeout: float = 30.0) -> dict:
@@ -36,6 +50,90 @@ async def _marker_exists(session, archive_uri: str, name: str) -> bool:
 
 class TestCommit:
     """Test commit"""
+
+    async def test_commit_completes_after_memory_parse_retries(
+        self, session_with_messages, monkeypatch
+    ):
+        from openviking.session.memory.session_extract_context_provider import (
+            SessionExtractContextProvider,
+        )
+
+        session = session_with_messages
+        completion = AsyncMock(return_value="invalid code!")
+        vlm = SimpleNamespace(model="local-test", max_tokens=4096, get_completion_async=completion)
+        resolver = session._session_compressor.vlm_resolver
+        monkeypatch.setattr(resolver, "get_vlm", AsyncMock(return_value=vlm))
+        monkeypatch.setattr(SessionExtractContextProvider, "prefetch", AsyncMock(return_value=[]))
+        result = await session.commit_async()
+        task = await _wait_for_task(result["task_id"])
+        assert task["status"] == "completed", task
+        assert not any(task["result"]["memories_extracted"].values())
+        assert completion.await_count >= 2
+        assert await _marker_exists(session, result["archive_uri"], ".done")
+        assert not await _marker_exists(session, result["archive_uri"], ".failed.json")
+
+    async def test_failed_commit_preserves_successful_memory_writes(
+        self, session_with_messages, monkeypatch
+    ):
+        session = session_with_messages
+        fs = session._viking_fs
+        compressor = session._session_compressor
+        # Index workers are outside the file-only commit fixture.
+        monkeypatch.setattr(compressor, "vikingdb", None)
+        monkeypatch.setattr(
+            "openviking.utils.embedding_utils.vectorize_directory_meta", AsyncMock()
+        )
+        monkeypatch.setattr(compressor.vlm_resolver, "get_vlm", AsyncMock())
+        root = f"viking://user/{session.ctx.user.user_id}/memories/events"
+        a, b, c = [f"{root}/{name}.md" for name in "abc"]
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_type="events",
+                    uris=[a, b, c],
+                    memory_fields={"event_name": "meeting", "summary": "Review", "ranges": "0"},
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+        run = AsyncMock(return_value=(operations, []))
+        react = SimpleNamespace(run=run)
+        monkeypatch.setattr(compressor, "_get_or_create_react", lambda **kw: react)
+        write = fs.write_file
+
+        async def write_except_b(uri, *args, **kwargs):
+            if uri == b:
+                raise OSError("injected write failure")
+            return await write(uri, *args, **kwargs)
+
+        monkeypatch.setattr(fs, "write_file", write_except_b)
+        commit = await session.commit_async()
+        task = await _wait_for_task(commit["task_id"])
+        assert task["status"] == "failed", task
+        assert f"{b}: injected write failure" in task["error"]
+        assert await fs.exists(a, ctx=session.ctx) and await fs.exists(c, ctx=session.ctx)
+        assert not await fs.exists(b, ctx=session.ctx)
+        run.assert_awaited_once()
+
+    async def test_memory_apply_failure_does_not_reextract(
+        self, session_with_messages, monkeypatch
+    ):
+        import openviking.session.session as session_module
+
+        monkeypatch.setattr(session_module, "_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS", 0)
+        session = session_with_messages
+        uri = "viking://user/default/memories/preferences/style.md"
+        result = MemoryUpdateResult()
+        result.add_error(uri, MemoryReadError(uri, TimeoutError("read timeout")))
+        extract = AsyncMock(side_effect=MemoryUpdateError(result))
+        session._session_compressor.extract_long_term_memories = extract
+        committed = await session.commit_async()
+        task = await _wait_for_task(committed["task_id"])
+        assert extract.await_count == 1
+        assert task["status"] == "failed"
+        meta = await session._archives.read_meta(committed["archive_uri"])
+        assert not meta.get("completed_memory_steps", {}).get("long_term")
 
     async def test_commit_preserves_unicode_separators_and_accepts_later_messages(
         self, wm_session_with_messages: Session
@@ -67,53 +165,61 @@ class TestCommit:
             if part["type"] == "text"
         }
 
-    async def test_commit_extracts_memories(
+    async def test_idle_callback_commits_current_backlog_without_activity_recheck(
         self,
         wm_session_with_messages: Session,
         service: OpenVikingService,
+        monkeypatch,
     ):
-        """Test commit kicks off background memory extraction"""
-
-        async def extract_long_term_memories(**kwargs):
-            archive_uri = kwargs["archive_uri"]
-            await wm_session_with_messages._viking_fs.write_file(
-                uri=f"{archive_uri}/memory_diff.json",
-                content=json.dumps({"archive_uri": archive_uri}),
-                ctx=wm_session_with_messages.ctx,
-            )
-            return []
-
-        wm_session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
-            side_effect=extract_long_term_memories
+        """An expiry callback archives the latest lock-protected snapshot."""
+        session = wm_session_with_messages
+        await session.update_config(
+            auto_commit_policy={"idle_timeout_seconds": 300, "keep_recent_count": 2},
+            update_auto_commit_policy=True,
         )
-        if hasattr(wm_session_with_messages._session_compressor, "extract_execution_memories"):
-            wm_session_with_messages._session_compressor.extract_execution_memories = AsyncMock(
-                return_value={"contexts": [], "session_skills": []}
-            )
-
-        result = await wm_session_with_messages.commit_async()
-        task_id = result["task_id"]
-
-        # Wait for background memory extraction to complete
-        task_result = await _wait_for_task(task_id)
-        assert task_result["status"] == "completed"
-        assert (
-            task_result["result"]["memory_diff_uri"]
-            == f"{task_result['result']['archive_uri']}/memory_diff.json"
+        session.meta.keep_recent_count = 2
+        await session._save_meta()
+        scheduler = MagicMock(spec=ExpiryScheduler)
+        service.sessions.configure_expiry(scheduler)
+        handler = scheduler.register_handler.call_args.args[1]
+        session = await service.sessions.get(session.session_id, session.ctx)
+        await session.add_message_async("user", [TextPart("latest activity")])
+        report = scheduler.report.await_args.args[0]
+        last_message_at = parse_iso_datetime(session.meta.last_message_at)
+        assert report.identity == ItemIdentity(
+            "session", session.ctx.account_id, session.ctx.user.user_id, session.session_id
         )
-        memory_diff = json.loads(
-            await wm_session_with_messages._viking_fs.read_file(
-                task_result["result"]["memory_diff_uri"],
-                ctx=wm_session_with_messages.ctx,
-            )
-        )
-        assert memory_diff["archive_uri"] == task_result["result"]["archive_uri"]
-        assert "memories_extracted" in task_result["result"]
-        memory_counts = task_result["result"]["memories_extracted"]
-        assert isinstance(memory_counts, dict)
+        assert report.due_at_ms == int(last_message_at.timestamp() * 1000) + 300_000
 
-        # The extraction stub emits no semantic or embedding work. Its task
-        # completion above is the relevant processing boundary for this test.
+        original_commit = Session.commit_async
+        commit_results = []
+
+        async def append_before_commit(loaded_session, **kwargs):
+            scheduler.report.side_effect = RuntimeError("expiry unavailable")
+            await loaded_session.add_message_async("user", [TextPart("append after idle check")])
+            result = await original_commit(loaded_session, **kwargs)
+            commit_results.append(result)
+            return result
+
+        monkeypatch.setattr(Session, "commit_async", append_before_commit)
+        callback = await handler.handle(CallbackRequest(report.identity))
+        assert callback.status is CallbackStatus.COMPLETED
+        assert callback.reason == "accepted"
+        assert scheduler.report.await_count == 2
+        result = commit_results[0]
+        assert result["status"] == "accepted"
+        archive_content = await session._viking_fs.read_file(
+            f"{result['archive_uri']}/messages.jsonl", ctx=session.ctx
+        )
+        archived_messages = [json.loads(line) for line in archive_content.split("\n") if line]
+        assert len(archived_messages) == 6
+        assert archived_messages[-1]["parts"][0]["text"] == "append after idle check"
+        persisted = await service.sessions.get(session.session_id, session.ctx)
+        assert persisted.messages == []
+        assert persisted.meta.keep_recent_count == 2
+        assert persisted.meta.last_idle_commit_accepted_at
+        phase1 = await persisted._read_phase1_meta(result["archive_uri"])
+        assert phase1["status"] == "ready"
 
     async def test_phase2_splits_with_the_committed_auto_commit_policy(
         self,
@@ -134,6 +240,7 @@ class TestCommit:
             messages,
             latest_archive_overview="",
             checkpoint_requests=None,
+            **kwargs,
         ):
             del checkpoint_requests
             working_memory_batches.append([message.id for message in messages])
@@ -154,8 +261,7 @@ class TestCommit:
         assert task_result["status"] == "completed"
         phase1 = await wm_session_with_messages._read_phase1_meta(result["archive_uri"])
         assert phase1["queue_message"]["auto_commit_policy"]["message_count_threshold"] == 1
-        assert len(working_memory_batches) == 4
-        assert all(len(batch) == 1 for batch in working_memory_batches)
+        assert len(working_memory_batches) == 1
         assert extract_long_term.await_count == 4
         assert all(len(call.kwargs["messages"]) == 1 for call in extract_long_term.await_args_list)
 
@@ -342,7 +448,7 @@ class TestCommit:
     ):
         memory_policy_provider = AsyncMock(
             return_value={
-                "memory_types": ["profile"],
+                "memory_types": ["profile", "soul", "identity"],
             }
         )
         session_with_messages._memory_policy_provider = memory_policy_provider
@@ -368,7 +474,7 @@ class TestCommit:
         wm_session_with_messages._agent_evolution_enabled_provider = lambda: False
         summary_called = False
 
-        async def fake_summary(_session, messages, latest_archive_overview=""):
+        async def fake_summary(_session, messages, latest_archive_overview="", **kwargs):
             nonlocal summary_called
             del messages, latest_archive_overview
             summary_called = True
@@ -480,7 +586,7 @@ class TestCommit:
 
         summary_called = False
 
-        async def fake_summary(messages, latest_archive_overview=""):
+        async def fake_summary(messages, latest_archive_overview="", **kwargs):
             nonlocal summary_called
             del messages, latest_archive_overview
             summary_called = True
@@ -526,7 +632,7 @@ class TestCommit:
         await session.ensure_exists()
         long_term_calls: list[dict] = []
 
-        async def fake_summary(messages, latest_archive_overview=""):
+        async def fake_summary(messages, latest_archive_overview="", **kwargs):
             del messages, latest_archive_overview
             return "Invoice support summary"
 
@@ -591,16 +697,65 @@ class TestCommit:
             },
         ]
 
-    async def test_commit_archives_messages(self, wm_session_with_messages: Session):
-        """Test commit archives messages"""
-        initial_message_count = len(wm_session_with_messages.messages)
-        assert initial_message_count > 0
+    async def test_successive_commits_write_their_own_memories(self, session, monkeypatch):
+        user = session.ctx.user.user_id
+        preferences = {"editor": "I use Neovim for Go", "terminal": "I use tmux on servers"}
 
-        result = await wm_session_with_messages.commit_async()
+        async def extract_preferences(*, messages, **_kwargs):
+            conversation = next(
+                message["content"]
+                for message in messages
+                if message["role"] == "user" and "**Session Time:**" in message["content"]
+            )
+            [(topic, preference)] = [
+                (topic, preference)
+                for topic, preference in preferences.items()
+                if preference in conversation
+            ]
+            return (
+                f"sdk.create_preferences(user={user!r}, topic={topic!r}, content={preference!r})\n"
+                "sdk.commit()"
+            )
 
-        assert result.get("archived") is True
-        # Current message list should be cleared after commit
-        assert len(wm_session_with_messages.messages) == 0
+        vlm = SimpleNamespace(
+            model="local-test", max_tokens=4096, get_completion_async=extract_preferences
+        )
+        compressor = session._session_compressor
+        monkeypatch.setattr(compressor.vlm_resolver, "get_vlm", AsyncMock(return_value=vlm))
+        # Give this test a fresh updater that flushes each write immediately.
+        monkeypatch.setattr(
+            "openviking.session.memory.streaming_memory_updater._streaming_memory_updater_registry",
+            {},
+        )
+        monkeypatch.setattr(
+            compressor,
+            "streaming_memory_updater_config",
+            StreamingMemoryUpdaterConfig(max_operations_per_update=1),
+        )
+        # The session fixture persists files but does not process index work.
+        monkeypatch.setattr(compressor, "vikingdb", None)
+        monkeypatch.setattr(
+            "openviking.utils.embedding_utils.vectorize_directory_meta", AsyncMock()
+        )
+
+        archive_uris = []
+        for preference in preferences.values():
+            message = await session.add_message_async("user", [TextPart(preference)])
+            commit = await session.commit_async(memory_policy={"memory_types": ["preferences"]})
+            task = await _wait_for_task(commit["task_id"])
+            assert task["status"] == "completed", task
+            assert sum(task["result"]["memories_extracted"].values()) == 1
+            archive_uri = commit["archive_uri"]
+            archive_uris.append(archive_uri)
+            archive = await session.get_session_archive(archive_uri.rsplit("/", 1)[-1])
+            assert [item["id"] for item in archive["messages"]] == [message.id]
+
+        assert len(set(archive_uris)) == 2
+        root = f"viking://user/{user}/memories/preferences/{user}"
+        for topic, preference in preferences.items():
+            content = await session._viking_fs.read_file(f"{root}/{topic}.md", ctx=session.ctx)
+            assert preference in content
+        assert session.messages == []
 
     async def test_commit_empty_session(self, session: Session):
         """Test committing empty session"""
@@ -610,27 +765,49 @@ class TestCommit:
         assert isinstance(result, dict)
         assert result.get("archived") is False
 
-    async def test_commit_multiple_times(self, client):
-        """Test multiple commits"""
+    async def test_commit_multiple_times(self, client, service):
+        """Later commits use updated account settings while preserving Working Memory."""
+        manager = service.runtime_config_manager
+        vlm = SimpleNamespace(
+            is_available=lambda: True,
+            max_tokens=4096,
+            get_completion_async=AsyncMock(return_value="# Working Memory\n\nAccount summary."),
+        )
+        service.sessions._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
         session = client(session_id="multi_commit_test")
         await session.ensure_exists()
+        extract = AsyncMock(return_value=[])
+        session._session_compressor.extract_long_term_memories = extract
+        policy = {"memory_types": ["profile"], "working_memory": {"enabled": True}}
+        await manager.patch_account(
+            session.ctx.account_id,
+            {"output_language_override": "en", "memory": {"extraction_enabled": False}},
+        )
 
-        # First round of conversation
         session.add_message("user", [TextPart("First round message")])
         session.add_message("assistant", [TextPart("First round response")])
-        result1 = await session.commit_async()
+        result1 = await session.commit_async(memory_policy=policy)
         assert result1.get("status") == "accepted"
-        assert result1.get("task_id") is not None
+        assert (await _wait_for_task(result1["task_id"]))["status"] == "completed"
+        assert await session._archives.read_overview(result1["archive_uri"])
+        extract.assert_not_awaited()
 
-        # Wait for first commit's background task to finish
-        await _wait_for_task(result1["task_id"])
-
-        # Second round of conversation
+        await manager.patch_account(
+            session.ctx.account_id,
+            {"output_language_override": "zh-CN", "memory": {"extraction_enabled": True}},
+        )
         session.add_message("user", [TextPart("Second round message")])
         session.add_message("assistant", [TextPart("Second round response")])
-        result2 = await session.commit_async()
+        result2 = await session.commit_async(memory_policy=policy)
         assert result2.get("status") == "accepted"
-        assert result2.get("task_id") is not None
+        assert (await _wait_for_task(result2["task_id"]))["status"] == "completed"
+        assert result1["archive_uri"] != result2["archive_uri"]
+        assert session.messages == []
+        extract.assert_awaited_once()
+        assert extract.await_args.kwargs["ctx"].account_id == session.ctx.account_id
+        prompts = str(vlm.get_completion_async.call_args_list)
+        assert "Write all section content in en." in prompts
+        assert "Write all section content in zh-CN." in prompts
 
     async def test_commit_keep_recent_count_retains_live_tail_and_resets_pending_tokens(
         self,
@@ -705,12 +882,13 @@ class TestCommit:
         session_type = type(session)
         original_generate = session_type._generate_archive_summary_async
 
-        async def capture_generate(self, messages, latest_archive_overview=""):
+        async def capture_generate(self, messages, latest_archive_overview="", **kwargs):
             seen["summary"] = latest_archive_overview
             return await original_generate(
                 self,
                 messages,
                 latest_archive_overview=latest_archive_overview,
+                **kwargs,
             )
 
         async def capture_extract(*args, **kwargs):
@@ -729,7 +907,9 @@ class TestCommit:
         assert seen["summary"] == previous_overview
         assert seen["extract"] == previous_overview
 
-    async def test_commit_failed_after_long_term_extraction_failure_does_not_block(self, client):
+    async def test_commit_failed_after_long_term_extraction_failure_does_not_block(
+        self, client, monkeypatch
+    ):
         """Binary archive outcome: if long-term extraction fails (after retries),
         the whole archive is marked .failed.json and skipped — there is no
         partial state — but a failed archive must not block the next commit.
@@ -737,11 +917,10 @@ class TestCommit:
         session = client(session_id="failed_archive_does_not_block_commit")
         await session.ensure_exists()
 
-        async def failing_extract(*args, **kwargs):
-            del args, kwargs
-            raise RuntimeError("synthetic extraction failure")
-
-        session._session_compressor.extract_long_term_memories = failing_extract
+        extract = AsyncMock(
+            return_value=[], side_effect=RuntimeError("synthetic extraction failure")
+        )
+        monkeypatch.setattr(session._session_compressor, "extract_long_term_memories", extract)
 
         session.add_message("user", [TextPart("First round message")])
         result = await session.commit_async()
@@ -763,8 +942,11 @@ class TestCommit:
         assert failed_payload.get("skipped") is True
         assert "synthetic extraction failure" in failed_payload["error"]
 
-        # A failed archive is a skippable terminal state and must not block the
-        # next commit (this previously raised FailedPreconditionError).
-        session.add_message("user", [TextPart("Second round message")])
+        extract.side_effect = None
+        message = await session.add_message_async("user", [TextPart("Second round message")])
         second = await session.commit_async()
-        assert second["status"] == "accepted"
+        second_task = await _wait_for_task(second["task_id"])
+        assert second_task["status"] == "completed", second_task
+        assert second["archive_uri"] != archive_uri
+        archive = await session.get_session_archive(second["archive_uri"].rsplit("/", 1)[-1])
+        assert [item["id"] for item in archive["messages"]] == [message.id]

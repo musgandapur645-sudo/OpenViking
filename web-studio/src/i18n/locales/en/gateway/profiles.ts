@@ -1,4 +1,6 @@
 const profiles = {
+  inUseHelp:
+    'To delete it, revoke those keys first. If they are still needed, issue replacements that use another profile.',
   description:
     'How conversations use OpenViking memory and tools. Saved changes apply only to conversations that start afterwards.',
   defaultName: 'Default',
@@ -17,7 +19,8 @@ const profiles = {
   empty: {
     title: 'No context profiles yet',
     description:
-      'Every gateway key needs a context profile. The recommended settings recall memory for each new message, save conversations, summarize long ones and let the model use the read-only OpenViking tools. You can change them at any time.',
+      'Every gateway key needs a context profile. The recommended settings recall memory for each new message, save conversations, summarize long ones and let the model use every OpenViking tool. You can change them at any time.',
+    readOnly: 'Waiting for your gateway admin to add a profile.',
   },
   summary: {
     recallOn: 'On · {{tokens}} tokens per message',
@@ -63,6 +66,11 @@ const profiles = {
     placeholder: 'e.g. Coding',
     description: 'Shown when you choose a profile for a gateway key.',
   },
+  clientOverrides: {
+    label: 'Let clients override settings',
+    description:
+      'Clients can change any setting below for a new conversation with the X-OpenViking-Context header, including budgets; for tools, it can only withhold more. Turn this off for a profile that must stay as saved.',
+  },
   recall: {
     title: 'Recall memory',
     description:
@@ -72,10 +80,15 @@ const profiles = {
       description:
         'Give the model your OpenViking profile when a conversation starts. This works independently of memory recall.',
     },
+    soul: {
+      label: 'Soul at conversation start',
+      description:
+        'Give the model your soul.md, the standing instructions you keep in OpenViking, when a conversation starts. The model is told to follow it. It is added whole and does not count against the opening context budget.',
+    },
     profileMaxTokens: {
       label: 'Opening context budget',
       description:
-        'Limit the profile and memory and skill catalogs provided at the start. Catalogs require the read tool. This budget is separate from recall; 0 omits all three.',
+        'Limit the profile and memory and skill catalogs provided at the start. Catalogs require the read tool. This budget is separate from recall; 0 omits all three. The soul is not counted.',
     },
     showRecall: {
       label: 'Show recall summary',
@@ -114,6 +127,13 @@ const profiles = {
       description:
         'Recall searches with the latest user message, cut to this length.',
     },
+    peerScope: {
+      label: 'Peer scope',
+      description:
+        "Which peers' memories recall and OpenViking tools can see besides the user's own.",
+      all: 'All peers, current peer first',
+      actor: 'Current peer only',
+    },
     quotas: {
       label: 'Limit by category',
       description:
@@ -133,19 +153,19 @@ const profiles = {
     description:
       'Write finished turns to an OpenViking session so OpenViking can extract memories.',
     idleSeconds: {
-      label: 'Save the latest reply after',
+      label: 'Commit when idle for',
       description:
-        'A turn is saved as soon as the next message arrives. The latest reply waits this long for a follow-up; then it is saved and OpenViking starts extracting memories.',
+        'Once no turn has ended for this long, everything saved is committed and memories are extracted. When the gateway leaves commits to OpenViking (openviking_auto_commit), values below 300 seconds count as 300 and the server needs session auto-commit enabled.',
     },
     commitTokens: {
       label: 'Commit after',
       description:
-        'Commit once this much saved conversation is waiting. OpenViking extracts memories when a commit happens.',
+        'When uncommitted messages reach this many tokens at the end of a turn, they are committed and memories are extracted, keeping the latest messages.',
     },
     keepRecentMessages: {
       label: 'Keep recent messages',
       description:
-        'Each commit leaves at least this many of the latest messages, in whole turns, in the session.',
+        'How many of the latest messages stay in the session when Commit after is reached.',
     },
   },
   longConversations: {
@@ -196,7 +216,7 @@ const profiles = {
     available: {
       label: 'Tools',
       description:
-        'The recommended settings select the read-only tools and leave the ones that change data unchecked. Tools added in the future are selected automatically. The upstream must allow OpenViking tools as well.',
+        'The recommended settings select every tool, including the ones that change data. Tools added in the future are selected automatically. The upstream must allow OpenViking tools as well.',
     },
     empty: 'Issue a gateway key to load the tool list.',
     loadFailed: "Couldn't load OpenViking tools",
@@ -212,7 +232,7 @@ const profiles = {
     maxRounds: {
       label: 'Rounds per request',
       description:
-        "After this many tool rounds, further OpenViking calls are refused; the model continues with the results it has and the client's own tools.",
+        "After this many tool rounds, further OpenViking calls are refused; the model continues with the results it has and the client's own tools. Leave empty for no limit.",
     },
     timeoutSeconds: {
       label: 'Time limit per call',
@@ -225,12 +245,12 @@ const profiles = {
     totalSeconds: {
       label: 'Total time',
       description:
-        'If the model is still using tools after this long, the request fails.',
+        'If the model is still using tools after this long, the request fails. Leave empty for no limit.',
     },
     totalTokens: {
       label: 'Token budget',
       description:
-        "Estimated tokens that tool calls and results may add to one request. Once used up, further OpenViking calls are refused; the model continues with the results it has and the client's own tools.",
+        "Estimated tokens that tool calls and results may add to one request. Once used up, further OpenViking calls are refused; the model continues with the results it has and the client's own tools. Leave empty for no limit.",
     },
   },
 }

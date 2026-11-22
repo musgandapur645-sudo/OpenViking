@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Native protocol adapters: what the gateway knows about each wire protocol."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from ..records import RecordKind as K
@@ -15,6 +16,17 @@ PROTOCOLS = {"chat": ChatProtocol, "responses": ResponsesProtocol, "anthropic": 
 
 def tool_protocol(protocol: str) -> type[ToolProtocol]:
     return PROTOCOLS[protocol]
+
+
+def stream_failure(protocol: str, body: dict, reason: str, response_id: str = "") -> bytes:
+    """The error event that ends a relayed stream the provider broke off."""
+    adapter = tool_protocol(protocol)(body or {})
+    adapter.begin()
+    if response_id:
+        # The client knows the reply by the provider's ID, not by one the gateway makes up.
+        adapter.identifier = response_id
+    message = f"{reason}: the model provider stopped before the reply finished"
+    return b"".join(adapter.encode(event) for event in adapter.error(message, kind=reason))
 
 
 @dataclass
@@ -59,15 +71,32 @@ class ResponseCapture:
         vars(self).update(adapter.reply())
 
     def event(self, body):
+        self.events([body])
+
+    def events(self, bodies):
+        """Events that arrived together; the reply is read once, after the last of them."""
         if self.assembler is None:
             self.assembler = tool_protocol(self.protocol)({})
             self.assembler.begin()
-        self.assembler.accumulate(body)
-        vars(self).update(self.assembler.reply())
+        try:
+            for body in bodies:
+                self.assembler.accumulate(body)
+        finally:
+            vars(self).update(self.assembler.reply())
 
 
-def hidden_chain(messages: list[dict], protocol: str) -> list[str]:
-    return tool_protocol(protocol).history_chain(messages)
+def hidden_chain(messages: list[dict], protocol: str, after: Sequence[str] = ()) -> list[str]:
+    """Anchors of ``messages``; ``after``, the chain of the history before them, continues it."""
+    return tool_protocol(protocol).history_chain(messages, after)
+
+
+def reply_chain(request, output: list[dict]) -> list[str]:
+    """``hidden_chain`` of the request's history followed by ``output``.
+
+    The request's ``capture_chain`` is that history's chain already, so only ``output``
+    is hashed: a reply costs its own size, not the whole history's.
+    """
+    return [*request.capture_chain, *hidden_chain(output, request.protocol, request.capture_chain)]
 
 
 def replay_hidden(

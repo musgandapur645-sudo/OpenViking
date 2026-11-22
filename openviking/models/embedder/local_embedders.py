@@ -145,7 +145,7 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         return target
 
     def _download_model(self, url: str, target: Path) -> None:
-        logger.info("Downloading local embedding model %s to %s", self.model_name, target)
+        logger.info("local embedding model download started")
         tmp_target = target.with_suffix(target.suffix + ".part")
         try:
             with requests.get(url, stream=True, timeout=(10, 300)) as response:
@@ -202,7 +202,7 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         formatted = self._format_text(text, is_query=is_query)
 
         try:
-            result = self._run_with_retry(
+            result = self._run_once(
                 lambda: self._embed_formatted_text(formatted),
                 logger=logger,
                 operation_name="local embedding",
